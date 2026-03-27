@@ -1,6 +1,7 @@
 from functools import lru_cache
 
 from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.controllers.market_controller import MarketController
 from app.schemas.market import HistoryResponse, IndicatorResponse, NewsResponse, PriceResponse
@@ -16,10 +17,16 @@ def get_settings() -> DataServiceSettings:
     return DataServiceSettings()
 
 
-def get_market_controller(request: Request) -> MarketController:
+async def get_session(request: Request):
+    async with request.app.state.session_factory() as session:
+        yield session
+
+
+def get_market_controller(request: Request, session: AsyncSession = Depends(get_session)) -> MarketController:
     service = MarketDataService(
         settings=request.app.state.settings,
         cache_service=request.app.state.cache_service,
+        session=session,
     )
     return MarketController(service=service)
 

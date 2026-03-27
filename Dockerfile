@@ -7,7 +7,6 @@ WORKDIR /app/ForesightX-data
 
 COPY shared/python /app/shared/python
 COPY ForesightX-data /app/ForesightX-data
-COPY ForesightX-pattern /app/ForesightX-pattern
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt

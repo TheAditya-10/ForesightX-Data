@@ -26,6 +26,7 @@ class NewsItem(BaseModel):
     headline: str
     timestamp: datetime
     source: str
+    url: str | None = None
 
 
 class NewsResponse(BaseModel):
