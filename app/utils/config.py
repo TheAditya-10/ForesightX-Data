@@ -1,8 +1,9 @@
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import SettingsConfigDict
 
-from shared import BaseServiceSettings
+from shared import BaseServiceSettings, normalize_postgres_async_url
 
 
 class DataServiceSettings(BaseServiceSettings):
@@ -13,6 +14,7 @@ class DataServiceSettings(BaseServiceSettings):
     cache_ttl_seconds: int = 60
     news_cache_ttl_seconds: int = 180
     history_cache_ttl_seconds: int = 300
+    finnhub_api_key: str = ""
 
     model_config = SettingsConfigDict(
         env_file=Path(__file__).resolve().parents[2] / ".env",
@@ -20,3 +22,8 @@ class DataServiceSettings(BaseServiceSettings):
         extra="ignore",
         case_sensitive=False,
     )
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: str) -> str:
+        return normalize_postgres_async_url(value)

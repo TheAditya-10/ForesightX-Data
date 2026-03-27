@@ -155,7 +155,38 @@ class MarketDataService:
         if not persisted_history.empty:
             return persisted_history, "service_database"
 
-        raise MarketDataServiceError(f"Unable to fetch market data for {ticker}")
+        self.logger.warning("Falling back to mock market history", extra={"ticker": ticker, "period": period})
+        return self._generate_mock_history(ticker=ticker, period=period), "mock_market"
+
+    def _generate_mock_history(self, ticker: str, period: str) -> pd.DataFrame:
+        points = {"7d": 7, "6mo": 183}.get(period, 30)
+        seed = int(hashlib.sha256(ticker.encode("utf-8")).hexdigest()[:8], 16)
+        rng = np.random.default_rng(seed)
+
+        # Keep mock series deterministic per ticker so repeated local tests are stable.
+        base_price = 90 + (seed % 120)
+        drift = rng.normal(0.0004, 0.0012, points)
+        noise = rng.normal(0.0, 0.008, points)
+        returns = drift + noise
+        close = base_price * np.cumprod(1 + returns)
+        close = np.clip(close, 5.0, None)
+
+        open_price = close * (1 + rng.normal(0.0, 0.003, points))
+        high = np.maximum(open_price, close) * (1 + rng.uniform(0.0005, 0.012, points))
+        low = np.minimum(open_price, close) * (1 - rng.uniform(0.0005, 0.012, points))
+        volume = rng.integers(900_000, 8_500_000, points)
+
+        index = pd.date_range(end=datetime.now(timezone.utc), periods=points, freq="D", tz="UTC")
+        return pd.DataFrame(
+            {
+                "Open": open_price,
+                "High": high,
+                "Low": low,
+                "Close": close,
+                "Volume": volume,
+            },
+            index=index,
+        )
 
     async def _fetch_yfinance_history(self, ticker: str, period: str) -> pd.DataFrame:
         def _load() -> pd.DataFrame:
@@ -176,6 +207,13 @@ class MarketDataService:
             return pd.DataFrame()
 
     async def _fetch_news(self, ticker: str) -> list[NewsItem]:
+        # Try Finnhub first (if API key configured)
+        if self.settings.finnhub_api_key:
+            finnhub_news = await self._fetch_finnhub_news(ticker)
+            if finnhub_news:
+                return finnhub_news
+
+        # Fallback to Yahoo Finance
         def _load_news() -> list[NewsItem]:
             instrument = yf.Ticker(ticker)
             raw_news = instrument.news or []
@@ -225,6 +263,43 @@ class MarketDataService:
                 source="mock_news",
             ),
         ]
+
+    async def _fetch_finnhub_news(self, ticker: str) -> list[NewsItem]:
+        """Fetch news from Finnhub API. Requires FINNHUB_API_KEY environment variable."""
+        import urllib.request
+        import json
+
+        def _load_finnhub_news() -> list[NewsItem]:
+            try:
+                url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&limit=5&token={self.settings.finnhub_api_key}"
+                req = urllib.request.Request(url, headers={"User-Agent": "ForesightX/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = json.loads(response.read().decode())
+                    
+                if not isinstance(data, list):
+                    return []
+                    
+                parsed_items: list[NewsItem] = []
+                for item in data[:5]:
+                    headline = item.get("headline")
+                    timestamp_unix = item.get("datetime")
+                    if not headline or not timestamp_unix:
+                        continue
+                    
+                    parsed_items.append(
+                        NewsItem(
+                            headline=headline,
+                            timestamp=datetime.fromtimestamp(int(timestamp_unix), tz=timezone.utc),
+                            source=item.get("source", "finnhub"),
+                            url=item.get("url"),
+                        )
+                    )
+                return parsed_items
+            except Exception as exc:
+                self.logger.warning(f"Finnhub news fetch failed for {ticker}: {exc}")
+                return []
+
+        return await asyncio.to_thread(_load_finnhub_news)
 
     async def _persist_history_frame(self, ticker: str, history: pd.DataFrame, source: str) -> None:
         rows = history.dropna(subset=["Close"])
