@@ -6,9 +6,9 @@ This service owns market data retrieval and technical computations.
 
 - fetch latest prices
 - return recent historical closes for charts
-- compute RSI and MACD
+- compute Relative Strength Index (RSI) and Moving Average Convergence Divergence (MACD)
 - expose recent news headlines
-- cache short-lived market responses in Redis
+<!-- - cache short-lived market responses in Redis -->
 
 ## API
 
