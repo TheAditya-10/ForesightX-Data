@@ -1,6 +1,7 @@
 from fastapi import HTTPException, status
 
 from app.schemas.market import (
+    BarsResponse,
     HistoryResponse,
     IndicatorResponse,
     InstrumentSearchResponse,
@@ -37,6 +38,12 @@ class MarketController:
     async def get_history(self, ticker: str, limit: int) -> HistoryResponse:
         try:
             return await self.service.get_history(ticker=ticker, limit=limit)
+        except MarketDataServiceError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    async def get_bars(self, ticker: str, limit: int, interval: str) -> BarsResponse:
+        try:
+            return await self.service.get_bars(ticker=ticker, limit=limit, interval=interval)
         except MarketDataServiceError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -16,7 +17,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from shared import get_logger
 
 from app.db.models import DailyPriceSnapshot, Instrument, InstrumentNews, NewsArticle, TechnicalIndicatorSnapshot
-from app.schemas.market import HistoryPoint, HistoryResponse, IndicatorResponse, NewsItem, NewsResponse, PriceResponse
+from app.schemas.market import (
+    BarPoint,
+    BarsResponse,
+    HistoryPoint,
+    HistoryResponse,
+    IndicatorResponse,
+    NewsItem,
+    NewsResponse,
+    PriceResponse,
+)
 from app.services.cache_service import CacheService
 from app.utils.config import DataServiceSettings
 from app.schemas.market import InstrumentSearchItem, InstrumentSearchResponse, RealtimeTick, RealtimeTickIn
@@ -80,6 +90,41 @@ class MarketDataService:
             source=source,
         )
         await self.cache_service.set_json(cache_key, response.model_dump(mode="json"), self.settings.history_cache_ttl_seconds)
+        return response
+
+    async def get_bars(self, ticker: str, limit: int, interval: str) -> BarsResponse:
+        validated = self._validate_ticker(ticker)
+        normalized_interval = interval.strip().lower()
+        if normalized_interval not in {"1h", "1d"}:
+            raise MarketDataServiceError(f"Unsupported interval '{interval}'. Expected one of: 1h, 1d")
+        cache_key = f"bars:{validated}:{normalized_interval}:{limit}"
+        cached = await self.cache_service.get_json(cache_key)
+        if cached:
+            return BarsResponse.model_validate(cached)
+
+        period = "90d" if normalized_interval == "1h" else "6mo"
+        history, source = await self._get_history_frame(validated, period=period, interval=normalized_interval)
+        trimmed = history.dropna(subset=["Open", "High", "Low", "Close"]).tail(limit)
+        if trimmed.empty:
+            raise MarketDataServiceError(f"No {normalized_interval} bar data available for {validated}")
+
+        response = BarsResponse(
+            ticker=validated,
+            interval=normalized_interval,
+            points=[
+                BarPoint(
+                    timestamp=self._normalize_timestamp(index),
+                    open=float(row["Open"]),
+                    high=float(row["High"]),
+                    low=float(row["Low"]),
+                    close=float(row["Close"]),
+                    volume=self._optional_int(row.get("Volume")),
+                )
+                for index, row in trimmed.iterrows()
+            ],
+            source=source,
+        )
+        await self.cache_service.set_json(cache_key, response.model_dump(mode="json"), self.settings.market_bars_cache_ttl_seconds)
         return response
 
     async def get_indicators(self, ticker: str) -> IndicatorResponse:
@@ -218,8 +263,8 @@ class MarketDataService:
         await self.cache_service.set_json(cache_key, response.model_dump(mode="json"), self.settings.cache_ttl_seconds)
         return response
 
-    async def _get_history_frame(self, ticker: str, period: str) -> tuple[pd.DataFrame, str]:
-        yahoo_history = await self._fetch_yfinance_history(ticker=ticker, period=period)
+    async def _get_history_frame(self, ticker: str, period: str, interval: str = "1d") -> tuple[pd.DataFrame, str]:
+        yahoo_history = await self._fetch_yfinance_history(ticker=ticker, period=period, interval=interval)
         if not yahoo_history.empty:
             await self._persist_history_frame(ticker=ticker, history=yahoo_history, source="yahoo_finance")
             return yahoo_history, "yahoo_finance"
@@ -228,55 +273,42 @@ class MarketDataService:
         if not persisted_history.empty:
             return persisted_history, "service_database"
 
-        self.logger.warning("Falling back to mock market history", extra={"ticker": ticker, "period": period})
-        return self._generate_mock_history(ticker=ticker, period=period), "mock_market"
+        raise MarketDataServiceError(f"Upstream market data unavailable for {ticker}")
 
-    def _generate_mock_history(self, ticker: str, period: str) -> pd.DataFrame:
-        points = {"7d": 7, "6mo": 183}.get(period, 30)
-        seed = int(hashlib.sha256(ticker.encode("utf-8")).hexdigest()[:8], 16)
-        rng = np.random.default_rng(seed)
-
-        # Keep mock series deterministic per ticker so repeated local tests are stable.
-        base_price = 90 + (seed % 120)
-        drift = rng.normal(0.0004, 0.0012, points)
-        noise = rng.normal(0.0, 0.008, points)
-        returns = drift + noise
-        close = base_price * np.cumprod(1 + returns)
-        close = np.clip(close, 5.0, None)
-
-        open_price = close * (1 + rng.normal(0.0, 0.003, points))
-        high = np.maximum(open_price, close) * (1 + rng.uniform(0.0005, 0.012, points))
-        low = np.minimum(open_price, close) * (1 - rng.uniform(0.0005, 0.012, points))
-        volume = rng.integers(900_000, 8_500_000, points)
-
-        index = pd.date_range(end=datetime.now(timezone.utc), periods=points, freq="D", tz="UTC")
-        return pd.DataFrame(
-            {
-                "Open": open_price,
-                "High": high,
-                "Low": low,
-                "Close": close,
-                "Volume": volume,
-            },
-            index=index,
-        )
-
-    async def _fetch_yfinance_history(self, ticker: str, period: str) -> pd.DataFrame:
+    async def _fetch_yfinance_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
         def _load() -> pd.DataFrame:
-            instrument = yf.Ticker(ticker)
-            history = instrument.history(period=period, interval="1d", auto_adjust=False)
-            if history.empty:
-                return pd.DataFrame()
-            if history.index.tz is None:
-                history.index = history.index.tz_localize(timezone.utc)
-            else:
-                history.index = history.index.tz_convert(timezone.utc)
-            return history
+            attempts = 3
+            for attempt in range(1, attempts + 1):
+                history = yf.download(
+                    ticker,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                    progress=False,
+                    prepost=False,
+                    threads=False,
+                    multi_level_index=True,
+                )
+                if not history.empty:
+                    if isinstance(history.columns, pd.MultiIndex):
+                        history.columns = history.columns.get_level_values(0)
+                    history = history.drop(
+                        columns=[column for column in history.columns if column not in {"Open", "High", "Low", "Close", "Volume"}],
+                        errors="ignore",
+                    )
+                    if history.index.tz is None:
+                        history.index = history.index.tz_localize(timezone.utc)
+                    else:
+                        history.index = history.index.tz_convert(timezone.utc)
+                    return history
+                if attempt < attempts:
+                    time.sleep(attempt)
+            return pd.DataFrame()
 
         try:
             return await asyncio.to_thread(_load)
         except Exception as exc:
-            self.logger.warning(f"Yahoo Finance fetch failed for {ticker}: {exc}")
+            self.logger.warning(f"Yahoo Finance fetch failed for {ticker} ({period}, {interval}): {exc}")
             return pd.DataFrame()
 
     async def _fetch_news(self, ticker: str) -> list[NewsItem]:
@@ -286,22 +318,33 @@ class MarketDataService:
             if finnhub_news:
                 return finnhub_news
 
-        # Fallback to Yahoo Finance
         def _load_news() -> list[NewsItem]:
             instrument = yf.Ticker(ticker)
             raw_news = instrument.news or []
             parsed_items: list[NewsItem] = []
             for item in raw_news[:5]:
-                title = item.get("title")
-                published = item.get("providerPublishTime")
+                content = item.get("content", {})
+                title = item.get("title") or content.get("title")
+                published = item.get("providerPublishTime") or content.get("pubDate")
                 if not title or not published:
                     continue
+                if isinstance(published, str):
+                    timestamp = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                else:
+                    timestamp = datetime.fromtimestamp(int(published), tz=timezone.utc)
+                provider = item.get("publisher") or content.get("provider", {}).get("displayName") or "yahoo_finance"
+                canonical_url = (
+                    item.get("link")
+                    or content.get("canonicalUrl", {}).get("url")
+                    or content.get("clickThroughUrl", {}).get("url")
+                    or content.get("previewUrl")
+                )
                 parsed_items.append(
                     NewsItem(
                         headline=title,
-                        timestamp=datetime.fromtimestamp(int(published), tz=timezone.utc),
-                        source=item.get("publisher", "yahoo_finance"),
-                        url=item.get("link"),
+                        timestamp=timestamp,
+                        source=provider,
+                        url=canonical_url,
                     )
                 )
             return parsed_items
@@ -316,26 +359,7 @@ class MarketDataService:
         persisted = await self._load_persisted_news(ticker)
         if persisted:
             return persisted
-
-        now = datetime.now(timezone.utc)
-        # Mock news remains explicit and traceable so downstream services can discount it if needed.
-        return [
-            NewsItem(
-                headline=f"{ticker} sees elevated options activity as traders react to fresh market momentum",
-                timestamp=now,
-                source="mock_news",
-            ),
-            NewsItem(
-                headline=f"Analysts reassess {ticker} valuation after sector-wide earnings repricing",
-                timestamp=now,
-                source="mock_news",
-            ),
-            NewsItem(
-                headline=f"Institutional flows into {ticker} remain mixed ahead of the next trading session",
-                timestamp=now,
-                source="mock_news",
-            ),
-        ]
+        raise MarketDataServiceError(f"No news data available for {ticker}")
 
     async def _fetch_finnhub_news(self, ticker: str) -> list[NewsItem]:
         """Fetch news from Finnhub API. Requires FINNHUB_API_KEY environment variable."""
@@ -344,7 +368,15 @@ class MarketDataService:
 
         def _load_finnhub_news() -> list[NewsItem]:
             try:
-                url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&limit=5&token={self.settings.finnhub_api_key}"
+                end_date = datetime.now(timezone.utc).date()
+                start_date = end_date - pd.Timedelta(days=7)
+                url = (
+                    "https://finnhub.io/api/v1/company-news"
+                    f"?symbol={ticker}"
+                    f"&from={start_date.isoformat()}"
+                    f"&to={end_date.isoformat()}"
+                    f"&token={self.settings.finnhub_api_key}"
+                )
                 req = urllib.request.Request(url, headers={"User-Agent": "ForesightX/1.0"})
                 with urllib.request.urlopen(req, timeout=5) as response:
                     data = json.loads(response.read().decode())
@@ -543,8 +575,6 @@ class MarketDataService:
 
         await self._ensure_instrument(ticker)
         for item in headlines:
-            if item.source == "mock_news":
-                continue
             article_key = self._article_external_id(ticker, item)
             article_statement = insert(NewsArticle).values(
                 {

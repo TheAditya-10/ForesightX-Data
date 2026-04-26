@@ -45,6 +45,22 @@ class HistoryResponse(BaseModel):
     source: str
 
 
+class BarPoint(BaseModel):
+    timestamp: datetime
+    open: float = Field(..., gt=0)
+    high: float = Field(..., gt=0)
+    low: float = Field(..., gt=0)
+    close: float = Field(..., gt=0)
+    volume: int | None = Field(default=None, ge=0)
+
+
+class BarsResponse(BaseModel):
+    ticker: str
+    interval: str
+    points: list[BarPoint]
+    source: str
+
+
 class RealtimeTickIn(BaseModel):
     ticker: str = Field(..., min_length=1, max_length=20)
     price: float = Field(..., gt=0)

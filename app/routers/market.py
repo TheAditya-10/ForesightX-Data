@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.controllers.market_controller import MarketController
 from app.schemas.market import (
+    BarsResponse,
     HistoryResponse,
     IndicatorResponse,
     InstrumentSearchResponse,
@@ -74,6 +75,16 @@ async def get_history(
     return await controller.get_history(ticker=ticker, limit=limit)
 
 
+@router.get("/bars/{ticker}", response_model=BarsResponse)
+async def get_bars(
+    ticker: str,
+    limit: int = Query(default=240, ge=48, le=720),
+    interval: str = Query(default="1h"),
+    controller: MarketController = Depends(get_market_controller),
+) -> BarsResponse:
+    return await controller.get_bars(ticker=ticker, limit=limit, interval=interval)
+
+
 @router.post("/stream/ingest", response_model=RealtimeTick)
 async def ingest_realtime_tick(
     payload: RealtimeTickIn,
@@ -100,7 +111,9 @@ async def stream_ticker(websocket: WebSocket, ticker: str) -> None:
     await websocket.accept()
     broker = websocket.app.state.stream_broker
     queue = await broker.subscribe(symbol)
+    yahoo_stream = websocket.app.state.yahoo_stream_service
     settings = websocket.app.state.settings
+    await yahoo_stream.ensure_subscription(symbol)
 
     await websocket.send_json(
         {
@@ -148,4 +161,5 @@ async def stream_ticker(websocket: WebSocket, ticker: str) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        await yahoo_stream.release_subscription(symbol)
         await broker.unsubscribe(symbol, queue)

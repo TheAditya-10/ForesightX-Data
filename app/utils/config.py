@@ -16,6 +16,8 @@ class DataServiceSettings(BaseServiceSettings):
     history_cache_ttl_seconds: int = 300
     stream_heartbeat_seconds: int = 15
     stream_queue_size: int = 64
+    yahoo_stream_enabled: bool = True
+    market_bars_cache_ttl_seconds: int = 120
     finnhub_api_key: str = ""
 
     model_config = SettingsConfigDict(
