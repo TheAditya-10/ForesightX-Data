@@ -1,6 +1,14 @@
 from fastapi import HTTPException, status
 
-from app.schemas.market import HistoryResponse, IndicatorResponse, NewsResponse, PriceResponse
+from app.schemas.market import (
+    HistoryResponse,
+    IndicatorResponse,
+    InstrumentSearchResponse,
+    NewsResponse,
+    PriceResponse,
+    RealtimeTick,
+    RealtimeTickIn,
+)
 from app.services.market_data_service import MarketDataService, MarketDataServiceError
 
 
@@ -31,3 +39,15 @@ class MarketController:
             return await self.service.get_history(ticker=ticker, limit=limit)
         except MarketDataServiceError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    async def ingest_tick(self, payload: RealtimeTickIn) -> RealtimeTick:
+        try:
+            return await self.service.ingest_tick(payload)
+        except MarketDataServiceError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    async def search_instruments(self, query: str, limit: int) -> InstrumentSearchResponse:
+        try:
+            return await self.service.search_instruments(query=query, limit=limit)
+        except MarketDataServiceError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc

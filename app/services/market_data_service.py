@@ -1,5 +1,8 @@
 import asyncio
 import hashlib
+import json
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 import numpy as np
@@ -16,6 +19,7 @@ from app.db.models import DailyPriceSnapshot, Instrument, InstrumentNews, NewsAr
 from app.schemas.market import HistoryPoint, HistoryResponse, IndicatorResponse, NewsItem, NewsResponse, PriceResponse
 from app.services.cache_service import CacheService
 from app.utils.config import DataServiceSettings
+from app.schemas.market import InstrumentSearchItem, InstrumentSearchResponse, RealtimeTick, RealtimeTickIn
 
 
 class MarketDataServiceError(RuntimeError):
@@ -143,6 +147,75 @@ class MarketDataService:
         response = NewsResponse(ticker=validated, headlines=headlines[:5])
         await self._persist_news(validated, response.headlines)
         await self.cache_service.set_json(cache_key, response.model_dump(mode="json"), self.settings.news_cache_ttl_seconds)
+        return response
+
+    async def ingest_tick(self, payload: RealtimeTickIn) -> RealtimeTick:
+        ticker = self._validate_ticker(payload.ticker)
+        tick = RealtimeTick(
+            ticker=ticker,
+            price=payload.price,
+            timestamp=payload.timestamp or datetime.now(timezone.utc),
+            volume=payload.volume,
+            source=payload.source,
+        )
+        await self._ensure_instrument(ticker)
+        statement = insert(DailyPriceSnapshot).values(
+            {
+                "instrument_ticker": tick.ticker,
+                "observed_at": tick.timestamp,
+                "open_price": tick.price,
+                "high_price": tick.price,
+                "low_price": tick.price,
+                "close_price": tick.price,
+                "volume": tick.volume,
+                "source": tick.source,
+            }
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=["instrument_ticker", "observed_at", "source"],
+            set_={
+                "open_price": tick.price,
+                "high_price": tick.price,
+                "low_price": tick.price,
+                "close_price": tick.price,
+                "volume": tick.volume,
+            },
+        )
+        await self.session.execute(statement)
+        await self.session.commit()
+        await self.cache_service.set_json(
+            f"price:{tick.ticker}",
+            PriceResponse(
+                ticker=tick.ticker,
+                price=tick.price,
+                timestamp=tick.timestamp,
+                source=tick.source,
+            ).model_dump(mode="json"),
+            self.settings.cache_ttl_seconds,
+        )
+        return tick
+
+    async def search_instruments(self, query: str, limit: int = 15) -> InstrumentSearchResponse:
+        clean_query = query.strip()
+        if not clean_query:
+            raise MarketDataServiceError("Search query cannot be empty")
+        cache_key = f"instrument_search:{clean_query.lower()}:{limit}"
+        cached = await self.cache_service.get_json(cache_key)
+        if cached:
+            return InstrumentSearchResponse.model_validate(cached)
+
+        yahoo_results = await self._fetch_yahoo_instrument_search(clean_query=clean_query, limit=limit)
+        db_results = await self._search_persisted_instruments(clean_query=clean_query, limit=limit)
+
+        merged: dict[str, InstrumentSearchItem] = {}
+        for item in [*yahoo_results, *db_results]:
+            existing = merged.get(item.ticker)
+            if existing is None or item.score > existing.score:
+                merged[item.ticker] = item
+
+        ranked = sorted(merged.values(), key=lambda item: item.score, reverse=True)[:limit]
+        response = InstrumentSearchResponse(query=clean_query, results=ranked)
+        await self.cache_service.set_json(cache_key, response.model_dump(mode="json"), self.settings.cache_ttl_seconds)
         return response
 
     async def _get_history_frame(self, ticker: str, period: str) -> tuple[pd.DataFrame, str]:
@@ -300,6 +373,76 @@ class MarketDataService:
                 return []
 
         return await asyncio.to_thread(_load_finnhub_news)
+
+    async def _fetch_yahoo_instrument_search(self, clean_query: str, limit: int) -> list[InstrumentSearchItem]:
+        def _load() -> list[InstrumentSearchItem]:
+            encoded = urllib.parse.quote(clean_query)
+            url = (
+                f"https://query2.finance.yahoo.com/v1/finance/search"
+                f"?q={encoded}&quotesCount={limit}&newsCount=0"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "ForesightX/1.0"})
+            with urllib.request.urlopen(req, timeout=6) as response:
+                payload = json.loads(response.read().decode())
+            quotes = payload.get("quotes", [])
+            items: list[InstrumentSearchItem] = []
+            for rank, quote in enumerate(quotes):
+                symbol = str(quote.get("symbol", "")).strip().upper()
+                if not symbol:
+                    continue
+                name = quote.get("shortname") or quote.get("longname")
+                exchange = quote.get("exchDisp") or quote.get("exchange")
+                score = max(0.1, 1.0 - (rank * 0.05))
+                if clean_query.lower() in symbol.lower():
+                    score += 0.5
+                if name and clean_query.lower() in str(name).lower():
+                    score += 0.4
+                items.append(
+                    InstrumentSearchItem(
+                        ticker=symbol,
+                        name=str(name) if name else None,
+                        exchange=str(exchange) if exchange else None,
+                        score=round(score, 3),
+                    )
+                )
+            return items
+
+        try:
+            return await asyncio.to_thread(_load)
+        except Exception as exc:
+            self.logger.warning(f"Yahoo instrument search failed for query '{clean_query}': {exc}")
+            return []
+
+    async def _search_persisted_instruments(self, clean_query: str, limit: int) -> list[InstrumentSearchItem]:
+        q = f"%{clean_query.lower()}%"
+        result = await self.session.execute(
+            select(Instrument)
+            .where(
+                (Instrument.is_active.is_(True))
+                & (
+                    Instrument.ticker.ilike(q)
+                    | Instrument.name.ilike(q)
+                )
+            )
+            .limit(limit)
+        )
+        instruments = result.scalars().all()
+        items: list[InstrumentSearchItem] = []
+        for instrument in instruments:
+            score = 0.3
+            if clean_query.lower() in instrument.ticker.lower():
+                score += 0.5
+            if instrument.name and clean_query.lower() in instrument.name.lower():
+                score += 0.4
+            items.append(
+                InstrumentSearchItem(
+                    ticker=instrument.ticker,
+                    name=instrument.name,
+                    exchange=instrument.exchange,
+                    score=round(score, 3),
+                )
+            )
+        return items
 
     async def _persist_history_frame(self, ticker: str, history: pd.DataFrame, source: str) -> None:
         rows = history.dropna(subset=["Close"])

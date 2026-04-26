@@ -17,6 +17,9 @@ This service owns market data retrieval and technical computations.
 - `GET /history/{ticker}?limit=30`
 - `GET /indicators/{ticker}`
 - `GET /news/{ticker}`
+- `GET /instruments/search?q=tata&limit=15`
+- `POST /stream/ingest`
+- `WS /stream/{ticker}`
 - `GET /health`
 
 ## Internal Layout
@@ -40,6 +43,14 @@ Key variables:
 - `CACHE_TTL_SECONDS`
 - `NEWS_CACHE_TTL_SECONDS`
 - `HISTORY_CACHE_TTL_SECONDS`
+- `STREAM_HEARTBEAT_SECONDS`
+- `STREAM_QUEUE_SIZE`
+
+## Real-time stream flow
+
+1. upstream adapter posts ticks to `POST /stream/ingest`
+2. service persists the tick and refreshes price cache
+3. service fans out tick payloads to websocket subscribers on `WS /stream/{ticker}`
 
 Schema ownership:
 

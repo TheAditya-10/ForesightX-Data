@@ -14,6 +14,8 @@ class DataServiceSettings(BaseServiceSettings):
     cache_ttl_seconds: int = 60
     news_cache_ttl_seconds: int = 180
     history_cache_ttl_seconds: int = 300
+    stream_heartbeat_seconds: int = 15
+    stream_queue_size: int = 64
     finnhub_api_key: str = ""
 
     model_config = SettingsConfigDict(
