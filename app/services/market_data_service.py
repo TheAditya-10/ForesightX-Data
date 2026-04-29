@@ -290,12 +290,7 @@ class MarketDataService:
                     multi_level_index=True,
                 )
                 if not history.empty:
-                    if isinstance(history.columns, pd.MultiIndex):
-                        history.columns = history.columns.get_level_values(0)
-                    history = history.drop(
-                        columns=[column for column in history.columns if column not in {"Open", "High", "Low", "Close", "Volume"}],
-                        errors="ignore",
-                    )
+                    history = self._normalize_yfinance_history(history, ticker)
                     if history.index.tz is None:
                         history.index = history.index.tz_localize(timezone.utc)
                     else:
@@ -511,6 +506,51 @@ class MarketDataService:
         await self.session.execute(statement)
         await self.session.commit()
 
+    @staticmethod
+    def _normalize_yfinance_history(history: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        expected_columns = ["Open", "High", "Low", "Close", "Volume"]
+        if history.empty:
+            return history
+
+        normalized = history.copy()
+        if isinstance(normalized.columns, pd.MultiIndex):
+            ticker_upper = ticker.upper()
+            price_level = None
+            for level in range(normalized.columns.nlevels):
+                labels = {str(value) for value in normalized.columns.get_level_values(level)}
+                if any(column in labels for column in expected_columns):
+                    price_level = level
+                    break
+
+            if price_level is not None:
+                for level in range(normalized.columns.nlevels):
+                    if level == price_level:
+                        continue
+                    labels = list(normalized.columns.get_level_values(level))
+                    matching_label = next((label for label in labels if str(label).upper() == ticker_upper), None)
+                    if matching_label is not None:
+                        normalized = normalized.xs(matching_label, axis=1, level=level, drop_level=True)
+                        break
+
+            if isinstance(normalized.columns, pd.MultiIndex):
+                if price_level is None:
+                    normalized.columns = normalized.columns.get_level_values(0)
+                else:
+                    normalized.columns = [column[price_level] for column in normalized.columns]
+
+        output = pd.DataFrame(index=normalized.index)
+        for column in expected_columns:
+            if column not in normalized.columns:
+                continue
+            values = normalized[column]
+            if isinstance(values, pd.DataFrame):
+                values = values.dropna(axis=1, how="all")
+                if values.empty:
+                    continue
+                values = values.iloc[:, 0]
+            output[column] = values
+        return output
+
     async def _load_persisted_history(self, ticker: str, period: str) -> pd.DataFrame:
         lookback_days = {"7d": 7, "6mo": 183}.get(period, 30)
         cutoff = datetime.now(timezone.utc) - pd.Timedelta(days=lookback_days)
@@ -643,12 +683,22 @@ class MarketDataService:
 
     @staticmethod
     def _optional_float(value) -> float | None:
+        if isinstance(value, pd.Series):
+            value = value.dropna()
+            if value.empty:
+                return None
+            value = value.iloc[0]
         if value is None or pd.isna(value):
             return None
         return float(value)
 
     @staticmethod
     def _optional_int(value) -> int | None:
+        if isinstance(value, pd.Series):
+            value = value.dropna()
+            if value.empty:
+                return None
+            value = value.iloc[0]
         if value is None or pd.isna(value):
             return None
         return int(value)
