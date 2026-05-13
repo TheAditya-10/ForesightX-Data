@@ -298,6 +298,7 @@ class MarketDataService:
                     return history
                 if attempt < attempts:
                     time.sleep(attempt)
+            self.logger.warning(f"Yahoo Finance returned empty history for {ticker} ({period}, {interval})")
             return pd.DataFrame()
 
         try:
