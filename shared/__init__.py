@@ -9,7 +9,6 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel
@@ -55,28 +54,16 @@ def normalize_postgres_async_url(url: str) -> str:
     if normalized.startswith(("\"", "'")) and normalized.endswith(("\"", "'")):
         normalized = normalized[1:-1].strip()
     lower = normalized.lower()
-    if lower.startswith("postgresql+psycopg2://"):
-        normalized = "postgresql+asyncpg://" + normalized[len("postgresql+psycopg2://") :]
-    elif lower.startswith("postgresql+psycopg://"):
-        normalized = "postgresql+asyncpg://" + normalized[len("postgresql+psycopg://") :]
+    if lower.startswith("postgresql+asyncpg://"):
+        normalized = "postgresql+psycopg://" + normalized[len("postgresql+asyncpg://") :]
+    elif lower.startswith("postgresql+psycopg2://"):
+        normalized = "postgresql+psycopg://" + normalized[len("postgresql+psycopg2://") :]
     elif lower.startswith("postgres://"):
-        normalized = "postgresql+asyncpg://" + normalized[len("postgres://") :]
-    elif lower.startswith("postgresql://") and "asyncpg" not in lower:
-        normalized = "postgresql+asyncpg://" + normalized[len("postgresql://") :]
+        normalized = "postgresql+psycopg://" + normalized[len("postgres://") :]
+    elif lower.startswith("postgresql://"):
+        normalized = "postgresql+psycopg://" + normalized[len("postgresql://") :]
 
-    parsed = urlsplit(normalized)
-    if parsed.scheme != "postgresql+asyncpg":
-        return normalized
-
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    sslmode = query.pop("sslmode", None)
-    if sslmode and "ssl" not in query:
-        query["ssl"] = sslmode
-    query.pop("channel_binding", None)
-    query.pop("gssencmode", None)
-    query.pop("target_session_attrs", None)
-
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+    return normalized
 
 
 def build_async_client(*, timeout: float = 8.0, **kwargs) -> httpx.AsyncClient:

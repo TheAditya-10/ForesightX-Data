@@ -7,7 +7,7 @@ pandas==2.2.2
 numpy==2.1.1
 yfinance==0.2.66
 sqlalchemy==2.0.39
-asyncpg==0.30.0
+psycopg[binary]==3.2.1
 
 alembic==1.15.1
 
