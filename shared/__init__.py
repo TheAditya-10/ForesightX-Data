@@ -51,10 +51,17 @@ def get_logger(service_name: str, component: Optional[str] = None) -> logging.Lo
 def normalize_postgres_async_url(url: str) -> str:
     if not isinstance(url, str):
         return url
-    normalized = url
-    if normalized.startswith("postgres://"):
+    normalized = url.strip()
+    if normalized.startswith(("\"", "'")) and normalized.endswith(("\"", "'")):
+        normalized = normalized[1:-1].strip()
+    lower = normalized.lower()
+    if lower.startswith("postgresql+psycopg2://"):
+        normalized = "postgresql+asyncpg://" + normalized[len("postgresql+psycopg2://") :]
+    elif lower.startswith("postgresql+psycopg://"):
+        normalized = "postgresql+asyncpg://" + normalized[len("postgresql+psycopg://") :]
+    elif lower.startswith("postgres://"):
         normalized = "postgresql+asyncpg://" + normalized[len("postgres://") :]
-    elif normalized.startswith("postgresql://") and "asyncpg" not in normalized:
+    elif lower.startswith("postgresql://") and "asyncpg" not in lower:
         normalized = "postgresql+asyncpg://" + normalized[len("postgresql://") :]
 
     parsed = urlsplit(normalized)
